@@ -1,8 +1,14 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ui';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:http/http.dart' as http;
+import 'package:image_picker/image_picker.dart';
+import 'package:speech_to_text/speech_recognition_result.dart';
+import 'package:speech_to_text/speech_to_text.dart';
 
 void main() {
   runApp(const ComputerClawApp());
@@ -50,77 +56,289 @@ class ChatEntry {
 class _KitisHomePageState extends State<KitisHomePage> {
   final TextEditingController _controller = TextEditingController();
   final ScrollController _scrollController = ScrollController();
+  final SpeechToText _speech = SpeechToText();
+  final FlutterTts _tts = FlutterTts();
+  final ImagePicker _imagePicker = ImagePicker();
 
-  final List<ChatEntry> _messages = const [
-    ChatEntry(role: 'assistant', text: 'Hey. I’m here. Talk to me when you’re ready.'),
-  ].toList();
+  final List<ChatEntry> _messages = <ChatEntry>[
+    const ChatEntry(role: 'assistant', text: 'Hey. I’m here. Talk to me when you’re ready.'),
+  ];
 
-  // Swap this later if your address changes.
-  final String _baseUrl = 'http://100.89.191.12:8787';
+  final String _baseUrl = 'http://localhost:8787';
 
   SpeakState _speakState = SpeakState.idle;
   bool _transcriptVisible = true;
   bool _menuOpen = false;
   bool _speakReplies = true;
+  bool _speechReady = false;
+  bool _sending = false;
+  bool _autoSendAfterSpeech = true;
   String _statusText = 'Ready';
+  String _liveTranscript = '';
+  String _draftText = '';
+  XFile? _selectedImage;
+  Timer? _autoSendTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _initSpeech();
+    _initTts();
+  }
+
+  Future<void> _initSpeech() async {
+    final available = await _speech.initialize(
+      onError: (error) {
+        if (!mounted) return;
+        setState(() {
+          _statusText = 'Mic error: ${error.errorMsg}';
+          _speakState = SpeakState.idle;
+        });
+      },
+      onStatus: (status) {
+        if (!mounted) return;
+        if (status == 'listening') {
+          setState(() {
+            _speakState = SpeakState.listening;
+            _statusText = 'Listening...';
+          });
+          return;
+        }
+        if (status == 'done' || status == 'notListening') {
+          setState(() {
+            _speakState = SpeakState.idle;
+            _statusText = _liveTranscript.isEmpty ? 'Ready' : 'Transcript captured';
+          });
+          _maybeAutoSendSpeech();
+          return;
+        }
+        setState(() {
+          _statusText = 'Mic status: $status';
+        });
+      },
+    );
+
+    if (!mounted) return;
+    setState(() {
+      _speechReady = available;
+      _statusText = available ? 'Ready' : 'Mic unavailable';
+    });
+  }
+
+  Future<void> _initTts() async {
+    await _tts.setLanguage('en-US');
+    await _tts.setSpeechRate(0.46);
+    await _tts.setPitch(1.0);
+    await _tts.awaitSpeakCompletion(true);
+
+    _tts.setStartHandler(() {
+      if (!mounted) return;
+      setState(() {
+        _speakState = SpeakState.speaking;
+        _statusText = 'Speaking...';
+      });
+    });
+
+    _tts.setCompletionHandler(() {
+      if (!mounted) return;
+      setState(() {
+        _speakState = SpeakState.idle;
+        _statusText = 'Ready';
+      });
+    });
+
+    _tts.setErrorHandler((message) {
+      if (!mounted) return;
+      setState(() {
+        _speakState = SpeakState.idle;
+        _statusText = 'TTS error';
+      });
+    });
+  }
 
   @override
   void dispose() {
+    _autoSendTimer?.cancel();
+    _speech.stop();
+    _tts.stop();
     _controller.dispose();
     _scrollController.dispose();
     super.dispose();
   }
 
-  Future<void> _sendMessage() async {
-    final message = _controller.text.trim();
-    if (message.isEmpty) return;
+  Future<void> _toggleListening() async {
+    if (_sending) return;
+
+    if (_speech.isListening) {
+      await _speech.stop();
+      if (!mounted) return;
+      setState(() {
+        _speakState = SpeakState.idle;
+        _statusText = _liveTranscript.isEmpty ? 'Ready' : 'Transcript captured';
+      });
+      _maybeAutoSendSpeech();
+      return;
+    }
+
+    if (!_speechReady) {
+      await _initSpeech();
+      if (!_speechReady) return;
+    }
 
     setState(() {
+      _liveTranscript = '';
+      _speakState = SpeakState.listening;
+      _statusText = 'Listening...';
+    });
+
+    await _speech.listen(
+      onResult: _onSpeechResult,
+      partialResults: true,
+      cancelOnError: true,
+      listenFor: const Duration(seconds: 20),
+    );
+  }
+
+  void _onSpeechResult(SpeechRecognitionResult result) {
+    if (!mounted) return;
+    setState(() {
+      _liveTranscript = result.recognizedWords;
+    });
+  }
+
+  void _maybeAutoSendSpeech() {
+    _autoSendTimer?.cancel();
+    if (!_autoSendAfterSpeech || _sending) return;
+
+    final message = _liveTranscript.trim().isNotEmpty
+        ? _liveTranscript.trim()
+        : _controller.text.trim().isNotEmpty
+            ? _controller.text.trim()
+            : _draftText.trim();
+    if (message.isEmpty) return;
+
+    _autoSendTimer = Timer(const Duration(milliseconds: 450), () {
+      if (!mounted || _sending) return;
+      final pending = _liveTranscript.trim().isNotEmpty
+          ? _liveTranscript.trim()
+          : _controller.text.trim().isNotEmpty
+              ? _controller.text.trim()
+              : _draftText.trim();
+      if (pending.isEmpty) return;
+      _sendMessage();
+    });
+  }
+
+  Future<void> _sendMessage() async {
+    _autoSendTimer?.cancel();
+    final message = _controller.text.trim().isNotEmpty
+        ? _controller.text.trim()
+        : _liveTranscript.trim().isNotEmpty
+            ? _liveTranscript.trim()
+            : _draftText.trim();
+    if (message.isEmpty || _sending) return;
+
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _sending = true;
       _messages.add(ChatEntry(role: 'user', text: message));
       _controller.clear();
+      _draftText = '';
+      _liveTranscript = '';
       _speakState = SpeakState.thinking;
       _statusText = 'Thinking...';
     });
     _scrollToBottom();
 
     try {
-      final response = await http.post(
-        Uri.parse('$_baseUrl/ask'),
-        headers: {'Content-Type': 'application/json'},
-        body: jsonEncode({'message': message}),
-      );
+      http.Response response;
 
-      final Map<String, dynamic> data = jsonDecode(response.body) as Map<String, dynamic>;
+      if (_selectedImage != null && !kIsWeb) {
+        final request = http.MultipartRequest('POST', Uri.parse('$_baseUrl/ask'));
+        request.fields['message'] = message;
+        request.files.add(await http.MultipartFile.fromPath('image', _selectedImage!.path));
+        final streamed = await request.send();
+        response = await http.Response.fromStream(streamed);
+      } else {
+        response = await http.post(
+          Uri.parse('$_baseUrl/ask'),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode({
+            'message': message,
+            if (_selectedImage != null) 'imageName': _selectedImage!.name,
+          }),
+        );
+      }
+
+      final dynamic decoded = response.body.isEmpty ? <String, dynamic>{} : jsonDecode(response.body);
+      final Map<String, dynamic> data = decoded is Map<String, dynamic>
+          ? decoded
+          : <String, dynamic>{'reply': decoded.toString()};
+
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        throw Exception(data['error'] ?? 'Request failed');
+        final detail = data['detail']?.toString();
+        final errorText = data['error']?.toString() ?? 'Request failed (${response.statusCode})';
+        throw Exception(detail == null || detail.isEmpty ? errorText : '$errorText — $detail');
       }
 
       final reply = (data['reply'] ?? 'No reply returned.').toString();
 
       setState(() {
         _messages.add(ChatEntry(role: 'assistant', text: reply));
-        _speakState = _speakReplies ? SpeakState.speaking : SpeakState.idle;
+        _selectedImage = null;
         _statusText = _speakReplies ? 'Speaking...' : 'Ready';
+        _speakState = _speakReplies ? SpeakState.speaking : SpeakState.idle;
       });
       _scrollToBottom();
 
-      // Placeholder: real TTS later.
       if (_speakReplies) {
-        await Future<void>.delayed(const Duration(milliseconds: 900));
-        if (!mounted) return;
-        setState(() {
-          _speakState = SpeakState.idle;
-          _statusText = 'Ready';
-        });
+        await _tts.stop();
+        await _tts.speak(reply);
       }
     } catch (error) {
+      if (!mounted) return;
       setState(() {
         _messages.add(ChatEntry(role: 'assistant', text: 'Error: $error'));
-        _speakState = SpeakState.idle;
         _statusText = 'Error';
+        _speakState = SpeakState.idle;
       });
       _scrollToBottom();
+    } finally {
+      if (!mounted) return;
+      setState(() {
+        _sending = false;
+        if (!_speakReplies) {
+          _statusText = 'Ready';
+          _speakState = SpeakState.idle;
+        }
+      });
     }
+  }
+
+  Future<void> _pickImage() async {
+    try {
+      final file = await _imagePicker.pickImage(source: ImageSource.gallery, imageQuality: 85);
+      if (file == null || !mounted) return;
+      setState(() {
+        _selectedImage = file;
+        _statusText = 'Image ready';
+      });
+    } catch (error) {
+      if (!mounted) return;
+      setState(() {
+        _statusText = 'Image picker error';
+      });
+    }
+  }
+
+  Future<void> _stopTalking() async {
+    await _speech.stop();
+    await _tts.stop();
+    if (!mounted) return;
+    setState(() {
+      _speakState = SpeakState.idle;
+      _statusText = 'Ready';
+    });
   }
 
   void _scrollToBottom() {
@@ -147,23 +365,18 @@ class _KitisHomePageState extends State<KitisHomePage> {
     });
   }
 
-  void _clearTranscript() {
+  Future<void> _clearTranscript() async {
+    await _stopTalking();
+    if (!mounted) return;
     setState(() {
       _messages
         ..clear()
         ..add(const ChatEntry(role: 'assistant', text: 'Transcript cleared. Fresh slate.'));
+      _selectedImage = null;
       _menuOpen = false;
-      _statusText = 'Ready';
-      _speakState = SpeakState.idle;
+      _liveTranscript = '';
     });
     _scrollToBottom();
-  }
-
-  void _stopTalking() {
-    setState(() {
-      _speakState = SpeakState.idle;
-      _statusText = 'Ready';
-    });
   }
 
   Color _speakColor() {
@@ -171,7 +384,7 @@ class _KitisHomePageState extends State<KitisHomePage> {
       case SpeakState.idle:
         return const Color(0xFF5EEAD4);
       case SpeakState.listening:
-        return const Color(0xFF5EEAD4);
+        return const Color(0xFF14B8A6);
       case SpeakState.thinking:
         return const Color(0xFFFACC15);
       case SpeakState.speaking:
@@ -275,16 +488,33 @@ class _KitisHomePageState extends State<KitisHomePage> {
               _statusPill(),
               const SizedBox(height: 18),
               _speakButton(),
-              const SizedBox(height: 18),
+              const SizedBox(height: 12),
+              if (_liveTranscript.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: 12),
+                  child: Text(
+                    _liveTranscript,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(color: Color(0xFFAAB4D6)),
+                  ),
+                ),
               Wrap(
                 spacing: 10,
                 runSpacing: 10,
                 alignment: WrapAlignment.center,
                 children: [
-                  _actionButton('Upload Image', Icons.image_outlined, null),
+                  _actionButton('Upload Image', Icons.image_outlined, _pickImage),
                   _actionButton('Stop Talking', Icons.stop_circle_outlined, _stopTalking),
                 ],
               ),
+              if (_selectedImage != null)
+                Padding(
+                  padding: const EdgeInsets.only(top: 12),
+                  child: Text(
+                    'Image ready: ${_selectedImage!.name}',
+                    style: const TextStyle(color: Color(0xFFFDA4AF)),
+                  ),
+                ),
               const SizedBox(height: 10),
               Row(
                 mainAxisAlignment: MainAxisAlignment.center,
@@ -294,6 +524,16 @@ class _KitisHomePageState extends State<KitisHomePage> {
                     onChanged: (value) => setState(() => _speakReplies = value),
                   ),
                   const Text('Speak replies'),
+                ],
+              ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Switch(
+                    value: _autoSendAfterSpeech,
+                    onChanged: (value) => setState(() => _autoSendAfterSpeech = value),
+                  ),
+                  const Text('Auto-send after speech'),
                 ],
               ),
             ],
@@ -355,6 +595,7 @@ class _KitisHomePageState extends State<KitisHomePage> {
                 controller: _controller,
                 minLines: 2,
                 maxLines: 4,
+                onChanged: (value) => _draftText = value,
                 decoration: InputDecoration(
                   hintText: 'Optional typed note...',
                   filled: true,
@@ -373,11 +614,17 @@ class _KitisHomePageState extends State<KitisHomePage> {
               Row(
                 children: [
                   FilledButton(
-                    onPressed: _sendMessage,
-                    child: const Text('Send'),
+                    onPressed: _sending ? null : _sendMessage,
+                    child: Text(_sending ? 'Sending...' : 'Send'),
                   ),
                   const SizedBox(width: 12),
-                  Text(_statusText, style: const TextStyle(color: Color(0xFFAAB4D6))),
+                  Expanded(
+                    child: Text(
+                      _statusText,
+                      style: const TextStyle(color: Color(0xFFAAB4D6)),
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
                 ],
               ),
             ],
@@ -433,12 +680,7 @@ class _KitisHomePageState extends State<KitisHomePage> {
 
   Widget _speakButton() {
     return GestureDetector(
-      onTap: () {
-        setState(() {
-          _speakState = SpeakState.listening;
-          _statusText = 'Listening...';
-        });
-      },
+      onTap: _toggleListening,
       child: AnimatedContainer(
         duration: const Duration(milliseconds: 180),
         width: 220,
@@ -470,9 +712,9 @@ class _KitisHomePageState extends State<KitisHomePage> {
     );
   }
 
-  Widget _actionButton(String label, IconData icon, VoidCallback? onTap) {
+  Widget _actionButton(String label, IconData icon, Future<void> Function()? onTap) {
     return OutlinedButton.icon(
-      onPressed: onTap,
+      onPressed: onTap == null ? null : () => onTap(),
       icon: Icon(icon, size: 18),
       label: Text(label),
       style: OutlinedButton.styleFrom(
