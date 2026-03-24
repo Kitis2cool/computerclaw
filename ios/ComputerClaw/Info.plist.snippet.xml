@@ -1,0 +1,5 @@
+<!-- Add these keys to your app Info.plist -->
+<key>NSSpeechRecognitionUsageDescription</key>
+<string>ComputerClaw uses speech recognition so you can talk to your assistant.</string>
+<key>NSMicrophoneUsageDescription</key>
+<string>ComputerClaw uses the microphone so you can speak to your assistant.</string>
