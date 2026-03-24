@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # ComputerClaw
 
 Native iPhone assistant app in SwiftUI with eventual wake-word support.
@@ -65,3 +66,22 @@ Version 3:
 - Open the `ios/ComputerClaw` folder in Xcode
 - Edit `APIClient.swift` to point at your backend host/Tailscale IP
 - Build Milestone 1 before worrying about wake word
+=======
+# flutter_app
+
+A new Flutter project.
+
+## Getting Started
+
+This project is a starting point for a Flutter application.
+
+A few resources to get you started if this is your first Flutter project:
+
+- [Learn Flutter](https://docs.flutter.dev/get-started/learn-flutter)
+- [Write your first Flutter app](https://docs.flutter.dev/get-started/codelab)
+- [Flutter learning resources](https://docs.flutter.dev/reference/learning-resources)
+
+For help getting started with Flutter development, view the
+[online documentation](https://docs.flutter.dev/), which offers tutorials,
+samples, guidance on mobile development, and a full API reference.
+>>>>>>> 7439262a25504ac5130471dff21d7bb4348a8d95
